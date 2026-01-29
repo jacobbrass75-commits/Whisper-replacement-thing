@@ -160,11 +160,11 @@ pub enum KeyboardImplementation {
 
 impl Default for KeyboardImplementation {
     fn default() -> Self {
-        // Default to HandyKeys only on macOS where it's well-tested.
-        // Windows and Linux use Tauri by default (handy-keys not sufficiently tested yet).
-        #[cfg(target_os = "macos")]
+        // Use HandyKeys on macOS and Windows for better modifier-only shortcut support.
+        // Linux uses Tauri by default.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         return KeyboardImplementation::HandyKeys;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         return KeyboardImplementation::Tauri;
     }
 }
@@ -537,7 +537,7 @@ pub const SETTINGS_STORE_PATH: &str = "settings_store.json";
 
 pub fn get_default_settings() -> AppSettings {
     #[cfg(target_os = "windows")]
-    let default_shortcut = "ctrl+space";
+    let default_shortcut = "ctrl+super";
     #[cfg(target_os = "macos")]
     let default_shortcut = "option+space";
     #[cfg(target_os = "linux")]
