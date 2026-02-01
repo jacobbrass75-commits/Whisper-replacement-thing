@@ -38,19 +38,113 @@ enum LoadedEngine {
 /// Very low threshold (0.001) to avoid rejecting quiet speech
 const MIN_AUDIO_ENERGY: f32 = 0.001;
 
-/// Check if audio has sufficient energy to contain speech
-/// Returns false for near-silence audio that would likely cause hallucinations
-fn has_sufficient_audio_energy(samples: &[f32]) -> bool {
+/// Minimum peak amplitude for valid audio (filters out near-zero signals)
+const MIN_PEAK_AMPLITUDE: f32 = 0.01;
+
+/// Valid zero crossing rate range for speech (0.01 to 0.5)
+/// Speech typically has moderate zero crossing rates
+/// Pure noise has very high rates, silence has very low rates
+const MIN_ZERO_CROSSING_RATE: f32 = 0.01;
+const MAX_ZERO_CROSSING_RATE: f32 = 0.5;
+
+/// Minimum samples needed for speech (0.25 seconds at 16kHz)
+const MIN_SPEECH_SAMPLES: usize = 4000;
+
+/// Maximum retries for transcription when hallucination is detected
+const MAX_TRANSCRIPTION_RETRIES: u32 = 2;
+
+/// Base delay for exponential backoff (100ms, 200ms, 400ms)
+const RETRY_DELAY_BASE_MS: u64 = 100;
+
+/// Expected max ratio of transcription time to audio duration
+/// Transcription should complete in less than 2x the audio length
+const EXPECTED_MAX_RATIO: f32 = 2.0;
+
+/// Audio quality analysis result
+#[derive(Debug)]
+struct AudioQuality {
+    rms_energy: f32,
+    peak_amplitude: f32,
+    zero_crossing_rate: f32,
+    is_valid: bool,
+    rejection_reason: Option<&'static str>,
+}
+
+/// Analyzes audio quality to determine if it's suitable for transcription
+///
+/// Checks:
+/// - RMS energy (must be above threshold)
+/// - Peak amplitude (must have actual signal)
+/// - Zero crossing rate (should be in speech range, not noise or silence)
+fn analyze_audio_quality(samples: &[f32]) -> AudioQuality {
     if samples.is_empty() {
-        return false;
+        return AudioQuality {
+            rms_energy: 0.0,
+            peak_amplitude: 0.0,
+            zero_crossing_rate: 0.0,
+            is_valid: false,
+            rejection_reason: Some("empty audio"),
+        };
     }
 
     // Calculate RMS (root mean square) energy
     let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
-    let rms = (sum_squares / samples.len() as f32).sqrt();
+    let rms_energy = (sum_squares / samples.len() as f32).sqrt();
 
-    rms >= MIN_AUDIO_ENERGY
+    // Calculate peak amplitude
+    let peak_amplitude = samples
+        .iter()
+        .map(|&s| s.abs())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
+
+    // Calculate zero crossing rate
+    let zero_crossings = samples
+        .windows(2)
+        .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+        .count();
+    let zero_crossing_rate = zero_crossings as f32 / samples.len() as f32;
+
+    // Validate audio quality
+    if rms_energy < MIN_AUDIO_ENERGY {
+        return AudioQuality {
+            rms_energy,
+            peak_amplitude,
+            zero_crossing_rate,
+            is_valid: false,
+            rejection_reason: Some("RMS energy too low"),
+        };
+    }
+
+    if peak_amplitude < MIN_PEAK_AMPLITUDE {
+        return AudioQuality {
+            rms_energy,
+            peak_amplitude,
+            zero_crossing_rate,
+            is_valid: false,
+            rejection_reason: Some("peak amplitude too low"),
+        };
+    }
+
+    if zero_crossing_rate < MIN_ZERO_CROSSING_RATE || zero_crossing_rate > MAX_ZERO_CROSSING_RATE {
+        return AudioQuality {
+            rms_energy,
+            peak_amplitude,
+            zero_crossing_rate,
+            is_valid: false,
+            rejection_reason: Some("zero crossing rate outside speech range"),
+        };
+    }
+
+    AudioQuality {
+        rms_energy,
+        peak_amplitude,
+        zero_crossing_rate,
+        is_valid: true,
+        rejection_reason: None,
+    }
 }
+
 
 #[derive(Clone)]
 pub struct TranscriptionManager {
@@ -379,12 +473,35 @@ impl TranscriptionManager {
             return Ok(String::new());
         }
 
-        // Check if audio has sufficient energy (skip near-silence to prevent hallucinations)
-        if !has_sufficient_audio_energy(&audio) {
-            debug!("Audio energy too low, skipping transcription to prevent hallucinations");
-            self.maybe_unload_immediately("low energy audio");
+        // Early exit: Skip transcription for clips too short to contain speech
+        if audio.len() < MIN_SPEECH_SAMPLES {
+            debug!(
+                "Audio too short ({} samples < {} minimum), skipping transcription",
+                audio.len(),
+                MIN_SPEECH_SAMPLES
+            );
+            self.maybe_unload_immediately("short audio");
             return Ok(String::new());
         }
+
+        // Check audio quality (RMS energy, peak amplitude, zero crossing rate)
+        let audio_quality = analyze_audio_quality(&audio);
+        if !audio_quality.is_valid {
+            debug!(
+                "Audio quality check failed: {:?} (RMS: {:.4}, Peak: {:.4}, ZCR: {:.4})",
+                audio_quality.rejection_reason,
+                audio_quality.rms_energy,
+                audio_quality.peak_amplitude,
+                audio_quality.zero_crossing_rate
+            );
+            self.maybe_unload_immediately("poor audio quality");
+            return Ok(String::new());
+        }
+
+        // Calculate expected max transcription time based on audio length
+        // Audio is at 16kHz, so duration_seconds = samples / 16000
+        let audio_duration_secs = audio.len() as f32 / 16000.0;
+        let expected_max_time_secs = audio_duration_secs * EXPECTED_MAX_RATIO;
 
         // Check if model is loaded, if not try to load it
         {
@@ -403,81 +520,123 @@ impl TranscriptionManager {
         // Get current settings for configuration
         let settings = get_settings(&self.app_handle);
 
-        // Perform transcription with the appropriate engine
-        let result = {
-            let mut engine_guard = self.engine.lock().unwrap();
-            let engine = engine_guard.as_mut().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Model failed to load after auto-load attempt. Please check your model settings."
-                )
-            })?;
+        // Retry loop for handling GPU contention hallucinations
+        let mut final_result = String::new();
+        let mut attempt = 0;
 
-            match engine {
-                LoadedEngine::Whisper(whisper_engine) => {
-                    // Normalize language code for Whisper
-                    // Convert zh-Hans and zh-Hant to zh since Whisper uses ISO 639-1 codes
-                    let whisper_language = if settings.selected_language == "auto" {
-                        None
-                    } else {
-                        let normalized = if settings.selected_language == "zh-Hans"
-                            || settings.selected_language == "zh-Hant"
-                        {
-                            "zh".to_string()
+        while attempt <= MAX_TRANSCRIPTION_RETRIES {
+            // Track transcription timing
+            let transcribe_start = std::time::Instant::now();
+
+            // Perform transcription with the appropriate engine
+            let result = {
+                let mut engine_guard = self.engine.lock().unwrap();
+                let engine = engine_guard.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Model failed to load after auto-load attempt. Please check your model settings."
+                    )
+                })?;
+
+                match engine {
+                    LoadedEngine::Whisper(whisper_engine) => {
+                        // Normalize language code for Whisper
+                        // Convert zh-Hans and zh-Hant to zh since Whisper uses ISO 639-1 codes
+                        let whisper_language = if settings.selected_language == "auto" {
+                            None
                         } else {
-                            settings.selected_language.clone()
+                            let normalized = if settings.selected_language == "zh-Hans"
+                                || settings.selected_language == "zh-Hant"
+                            {
+                                "zh".to_string()
+                            } else {
+                                settings.selected_language.clone()
+                            };
+                            Some(normalized)
                         };
-                        Some(normalized)
-                    };
 
-                    let params = WhisperInferenceParams {
-                        language: whisper_language,
-                        translate: settings.translate_to_english,
-                        ..Default::default()
-                    };
+                        let params = WhisperInferenceParams {
+                            language: whisper_language.clone(),
+                            translate: settings.translate_to_english,
+                            ..Default::default()
+                        };
 
-                    whisper_engine
-                        .transcribe_samples(audio, Some(params))
-                        .map_err(|e| anyhow::anyhow!("Whisper transcription failed: {}", e))?
+                        whisper_engine
+                            .transcribe_samples(audio.clone(), Some(params))
+                            .map_err(|e| anyhow::anyhow!("Whisper transcription failed: {}", e))?
+                    }
+                    LoadedEngine::Parakeet(parakeet_engine) => {
+                        let params = ParakeetInferenceParams {
+                            timestamp_granularity: TimestampGranularity::Segment,
+                            ..Default::default()
+                        };
+                        parakeet_engine
+                            .transcribe_samples(audio.clone(), Some(params))
+                            .map_err(|e| anyhow::anyhow!("Parakeet transcription failed: {}", e))?
+                    }
+                    LoadedEngine::Moonshine(moonshine_engine) => moonshine_engine
+                        .transcribe_samples(audio.clone(), None)
+                        .map_err(|e| anyhow::anyhow!("Moonshine transcription failed: {}", e))?,
                 }
-                LoadedEngine::Parakeet(parakeet_engine) => {
-                    let params = ParakeetInferenceParams {
-                        timestamp_granularity: TimestampGranularity::Segment,
-                        ..Default::default()
-                    };
-                    parakeet_engine
-                        .transcribe_samples(audio, Some(params))
-                        .map_err(|e| anyhow::anyhow!("Parakeet transcription failed: {}", e))?
-                }
-                LoadedEngine::Moonshine(moonshine_engine) => moonshine_engine
-                    .transcribe_samples(audio, None)
-                    .map_err(|e| anyhow::anyhow!("Moonshine transcription failed: {}", e))?,
+            };
+
+            // Check transcription timing
+            let transcribe_elapsed = transcribe_start.elapsed();
+            let transcribe_secs = transcribe_elapsed.as_secs_f32();
+
+            if transcribe_secs > expected_max_time_secs {
+                warn!(
+                    "Transcription took abnormally long: {:.2}s (expected max: {:.2}s for {:.2}s audio). \
+                     Possible GPU contention.",
+                    transcribe_secs,
+                    expected_max_time_secs,
+                    audio_duration_secs
+                );
             }
-        };
 
-        // Apply word correction if custom words are configured
-        let corrected_result = if !settings.custom_words.is_empty() {
-            apply_custom_words(
-                &result.text,
-                &settings.custom_words,
-                settings.word_correction_threshold,
-            )
-        } else {
-            result.text
-        };
+            // Apply word correction if custom words are configured
+            let corrected_result = if !settings.custom_words.is_empty() {
+                apply_custom_words(
+                    &result.text,
+                    &settings.custom_words,
+                    settings.word_correction_threshold,
+                )
+            } else {
+                result.text
+            };
 
-        // Filter out filler words and hallucinations
-        let filtered_result = filter_transcription_output(&corrected_result);
+            // Filter out filler words and hallucinations
+            let filtered_result = filter_transcription_output(&corrected_result);
 
-        // Final hallucination check - return empty if result looks like garbage
-        let final_result = if is_likely_hallucination(&filtered_result) {
-            debug!(
-                "Detected likely hallucination, discarding: {:?}",
-                filtered_result
-            );
-            String::new()
-        } else {
-            filtered_result
-        };
+            // Check for hallucination
+            if is_likely_hallucination(&filtered_result) {
+                if attempt < MAX_TRANSCRIPTION_RETRIES {
+                    let delay_ms = RETRY_DELAY_BASE_MS * (1 << attempt); // Exponential backoff: 100, 200, 400ms
+                    debug!(
+                        "Detected likely hallucination on attempt {}/{}, retrying after {}ms: {:?}",
+                        attempt + 1,
+                        MAX_TRANSCRIPTION_RETRIES + 1,
+                        delay_ms,
+                        filtered_result
+                    );
+                    thread::sleep(Duration::from_millis(delay_ms));
+                    attempt += 1;
+                    continue;
+                } else {
+                    debug!(
+                        "Detected likely hallucination after all retries, discarding: {:?}",
+                        filtered_result
+                    );
+                    final_result = String::new();
+                    break;
+                }
+            } else {
+                final_result = filtered_result;
+                if attempt > 0 {
+                    debug!("Successful transcription after {} retries", attempt);
+                }
+                break;
+            }
+        }
 
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {

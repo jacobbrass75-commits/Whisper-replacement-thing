@@ -202,6 +202,71 @@ const HALLUCINATION_PHRASES: &[&str] = &[
     "[applause]",
 ];
 
+/// Detects GPU contention-induced hallucinations
+///
+/// When the GPU is under heavy load, Whisper can produce garbage output like:
+/// - All punctuation: "!!!!!!!!", "...???.."
+/// - Short text with excessive punctuation: "a!", "!a!"
+/// - Repetitive single-word nonsense: "you you you you"
+/// - Unicode garbage with non-printable characters
+///
+/// Returns true if the text appears to be GPU-induced garbage
+pub fn is_gpu_contention_hallucination(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Detect all-punctuation output (e.g., "!!!!!!!!", "...???..")
+    let non_space_chars: Vec<char> = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if !non_space_chars.is_empty() && non_space_chars.iter().all(|c| c.is_ascii_punctuation()) {
+        return true;
+    }
+
+    // Detect short text with >=50% punctuation (e.g., "a!", "!a!")
+    if trimmed.len() <= 5 && !non_space_chars.is_empty() {
+        let punct_count = non_space_chars.iter().filter(|c| c.is_ascii_punctuation()).count();
+        let punct_ratio = punct_count as f64 / non_space_chars.len() as f64;
+        if punct_ratio >= 0.5 {
+            return true;
+        }
+    }
+
+    // Detect repetitive single-word nonsense (e.g., "you you you you")
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 4 {
+        let first_word = words[0].to_lowercase();
+        let repetitive_count = words.iter().filter(|w| w.to_lowercase() == first_word).count();
+        // If >75% of words are the same word, it's likely garbage
+        if repetitive_count as f64 / words.len() as f64 > 0.75 {
+            return true;
+        }
+    }
+
+    // Detect unicode garbage (non-printable chars, excluding common whitespace)
+    let has_garbage_chars = trimmed.chars().any(|c| {
+        // Allow normal printable ASCII and common unicode letters/punctuation
+        // Flag control characters, private use area, and other garbage
+        c.is_control() && c != '\n' && c != '\r' && c != '\t'
+            || ('\u{E000}'..='\u{F8FF}').contains(&c)  // Private Use Area
+            || ('\u{FFF0}'..='\u{FFFF}').contains(&c)  // Specials block (replacement chars, etc.)
+    });
+    if has_garbage_chars {
+        return true;
+    }
+
+    // Detect extremely short output with mostly non-alphabetic characters
+    if trimmed.len() <= 3 {
+        let alpha_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+        if alpha_count == 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Collapses repeated 1-2 letter words (3+ repetitions) to a single instance.
 /// E.g., "wh wh wh wh" -> "wh", "I I I I" -> "I"
 fn collapse_stutters(text: &str) -> String {
@@ -256,12 +321,18 @@ static FILLER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 /// Detects if text is likely a Whisper hallucination (garbage output)
 ///
 /// Returns true if the text appears to be:
+/// - GPU contention hallucination (all punctuation, repetitive words, garbage chars)
 /// - Empty or very short (fewer than 2 characters)
 /// - Has extremely high ratio of non-alphabetic chars (>70%)
 /// - Is extremely repetitive (10+ chars with only 1-2 unique characters)
 /// - Contains known hallucination phrases
 pub fn is_likely_hallucination(text: &str) -> bool {
     let trimmed = text.trim();
+
+    // Check for GPU contention hallucinations first (fast check)
+    if is_gpu_contention_hallucination(trimmed) {
+        return true;
+    }
 
     // Empty or very short text after trimming
     if trimmed.len() < 2 {
@@ -520,5 +591,71 @@ mod tests {
         assert!(!is_likely_hallucination("Hello world"));
         assert!(!is_likely_hallucination("This is a normal sentence."));
         assert!(!is_likely_hallucination("Testing 123"));
+    }
+
+    // GPU contention hallucination tests
+    #[test]
+    fn test_gpu_hallucination_all_punctuation() {
+        // All-punctuation outputs are GPU contention hallucinations
+        assert!(is_gpu_contention_hallucination("!!!!!!!!"));
+        assert!(is_gpu_contention_hallucination("...???..."));
+        assert!(is_gpu_contention_hallucination("!?!?!?!?"));
+        assert!(is_gpu_contention_hallucination("---...---"));
+        assert!(is_gpu_contention_hallucination(",,,"));
+    }
+
+    #[test]
+    fn test_gpu_hallucination_short_with_punctuation() {
+        // Short text with >50% punctuation is hallucination
+        assert!(is_gpu_contention_hallucination("a!"));
+        assert!(is_gpu_contention_hallucination("!a!"));
+        assert!(is_gpu_contention_hallucination("..a"));
+        // But normal short text is fine
+        assert!(!is_gpu_contention_hallucination("hello"));
+        assert!(!is_gpu_contention_hallucination("Hi"));
+    }
+
+    #[test]
+    fn test_gpu_hallucination_repetitive_words() {
+        // Repetitive single-word nonsense is hallucination
+        assert!(is_gpu_contention_hallucination("you you you you"));
+        assert!(is_gpu_contention_hallucination("the the the the the"));
+        assert!(is_gpu_contention_hallucination("a a a a a a"));
+        // But normal text with some repetition is fine
+        assert!(!is_gpu_contention_hallucination("I think I think we should go"));
+        assert!(!is_gpu_contention_hallucination("hello world"));
+    }
+
+    #[test]
+    fn test_gpu_hallucination_unicode_garbage() {
+        // Unicode garbage with control characters
+        assert!(is_gpu_contention_hallucination("hello\x00world"));
+        assert!(is_gpu_contention_hallucination("test\x1Fdata"));
+        // Private use area characters
+        assert!(is_gpu_contention_hallucination("text\u{E000}here"));
+        // Normal unicode is fine
+        assert!(!is_gpu_contention_hallucination("Hello café"));
+        assert!(!is_gpu_contention_hallucination("日本語テスト"));
+    }
+
+    #[test]
+    fn test_valid_transcriptions_not_flagged() {
+        // Normal transcriptions should not be flagged
+        assert!(!is_gpu_contention_hallucination("Hello, how are you today?"));
+        assert!(!is_gpu_contention_hallucination("The quick brown fox jumps over the lazy dog."));
+        assert!(!is_gpu_contention_hallucination("Testing 1 2 3"));
+        assert!(!is_gpu_contention_hallucination("What's going on?"));
+        assert!(!is_gpu_contention_hallucination("I can't believe it!"));
+        // Short but valid
+        assert!(!is_gpu_contention_hallucination("OK"));
+        assert!(!is_gpu_contention_hallucination("yes"));
+        assert!(!is_gpu_contention_hallucination("no"));
+    }
+
+    #[test]
+    fn test_gpu_hallucination_empty_and_whitespace() {
+        assert!(is_gpu_contention_hallucination(""));
+        assert!(is_gpu_contention_hallucination("   "));
+        assert!(is_gpu_contention_hallucination("\t\n"));
     }
 }
