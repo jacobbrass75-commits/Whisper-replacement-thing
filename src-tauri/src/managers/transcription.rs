@@ -1,4 +1,4 @@
-use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
+use crate::audio_toolkit::{apply_custom_words, filter_transcription_output, is_likely_hallucination};
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{get_settings, ModelUnloadTimeout};
 use anyhow::Result;
@@ -32,6 +32,24 @@ enum LoadedEngine {
     Whisper(WhisperEngine),
     Parakeet(ParakeetEngine),
     Moonshine(MoonshineEngine),
+}
+
+/// Minimum RMS energy threshold for audio to be considered speech
+/// Very low threshold (0.001) to avoid rejecting quiet speech
+const MIN_AUDIO_ENERGY: f32 = 0.001;
+
+/// Check if audio has sufficient energy to contain speech
+/// Returns false for near-silence audio that would likely cause hallucinations
+fn has_sufficient_audio_energy(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+
+    // Calculate RMS (root mean square) energy
+    let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
+    let rms = (sum_squares / samples.len() as f32).sqrt();
+
+    rms >= MIN_AUDIO_ENERGY
 }
 
 #[derive(Clone)]
@@ -361,6 +379,13 @@ impl TranscriptionManager {
             return Ok(String::new());
         }
 
+        // Check if audio has sufficient energy (skip near-silence to prevent hallucinations)
+        if !has_sufficient_audio_energy(&audio) {
+            debug!("Audio energy too low, skipping transcription to prevent hallucinations");
+            self.maybe_unload_immediately("low energy audio");
+            return Ok(String::new());
+        }
+
         // Check if model is loaded, if not try to load it
         {
             // If the model is loading, wait for it to complete.
@@ -443,6 +468,17 @@ impl TranscriptionManager {
         // Filter out filler words and hallucinations
         let filtered_result = filter_transcription_output(&corrected_result);
 
+        // Final hallucination check - return empty if result looks like garbage
+        let final_result = if is_likely_hallucination(&filtered_result) {
+            debug!(
+                "Detected likely hallucination, discarding: {:?}",
+                filtered_result
+            );
+            String::new()
+        } else {
+            filtered_result
+        };
+
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {
             " (translated)"
@@ -454,8 +490,6 @@ impl TranscriptionManager {
             (et - st).as_millis(),
             translation_note
         );
-
-        let final_result = filtered_result;
 
         if final_result.is_empty() {
             info!("Transcription result is empty");

@@ -142,6 +142,66 @@ const FILLER_WORDS: &[&str] = &[
 
 static MULTI_SPACE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
 
+/// Patterns for repeated punctuation: "!!!!" -> "!" (regex crate doesn't support backrefs)
+static REPEATED_EXCLAMATION: Lazy<Regex> = Lazy::new(|| Regex::new(r"!{3,}").unwrap());
+static REPEATED_QUESTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"\?{3,}").unwrap());
+static REPEATED_PERIOD: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.{4,}").unwrap()); // Allow "..."
+static REPEATED_COMMA: Lazy<Regex> = Lazy::new(|| Regex::new(r",{3,}").unwrap());
+static REPEATED_DASH: Lazy<Regex> = Lazy::new(|| Regex::new(r"-{3,}").unwrap());
+
+/// Removes repeated single characters like "f f f f f" (5+ occurrences)
+/// This targets hallucination patterns, not stutters (which collapse_stutters handles at 3+)
+fn remove_repeated_single_chars(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result: Vec<&str> = Vec::new();
+    let mut i = 0;
+
+    while i < words.len() {
+        let word = words[i];
+        let word_lower = word.to_lowercase();
+
+        // Check for single letter repeated with spaces (e.g., "f f f f f")
+        if word_lower.len() == 1 && word_lower.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            let target_char = word_lower.chars().next().unwrap();
+            let mut count = 1;
+            while i + count < words.len() {
+                let next_word = words[i + count].to_lowercase();
+                if next_word.len() == 1 && next_word.chars().next() == Some(target_char) {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            // If 5+ repetitions, skip all of them (hallucination pattern)
+            // 3-4 repetitions are handled by collapse_stutters as legitimate stutters
+            if count >= 5 {
+                i += count;
+                continue;
+            }
+        }
+
+        result.push(word);
+        i += 1;
+    }
+
+    result.join(" ")
+}
+
+/// Common hallucination phrases that Whisper produces on silence/noise
+const HALLUCINATION_PHRASES: &[&str] = &[
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subtitled by",
+    "transcribed by",
+    "[music]",
+    "[applause]",
+];
+
 /// Collapses repeated 1-2 letter words (3+ repetitions) to a single instance.
 /// E.g., "wh wh wh wh" -> "wh", "I I I I" -> "I"
 fn collapse_stutters(text: &str) -> String {
@@ -193,20 +253,83 @@ static FILLER_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         .collect()
 });
 
-/// Filters transcription output by removing filler words and stutter artifacts.
+/// Detects if text is likely a Whisper hallucination (garbage output)
+///
+/// Returns true if the text appears to be:
+/// - Empty or very short (fewer than 2 characters)
+/// - Has extremely high ratio of non-alphabetic chars (>70%)
+/// - Is extremely repetitive (10+ chars with only 1-2 unique characters)
+/// - Contains known hallucination phrases
+pub fn is_likely_hallucination(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // Empty or very short text after trimming
+    if trimmed.len() < 2 {
+        return true;
+    }
+
+    // Check for known hallucination phrases (case-insensitive)
+    let lower = trimmed.to_lowercase();
+    for phrase in HALLUCINATION_PHRASES {
+        if lower.contains(&phrase.to_lowercase()) {
+            return true;
+        }
+    }
+
+    // High ratio of non-alphabetic characters (>70%)
+    let alpha_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    let total_non_space = trimmed.chars().filter(|c| !c.is_whitespace()).count();
+    if total_non_space > 0 {
+        let alpha_ratio = alpha_count as f64 / total_non_space as f64;
+        if alpha_ratio < 0.3 {
+            return true;
+        }
+    }
+
+    // Extremely repetitive: 10+ chars with only 1-2 unique chars
+    let non_space_chars: Vec<char> = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if non_space_chars.len() >= 10 {
+        let mut unique_chars: Vec<char> = non_space_chars.clone();
+        unique_chars.sort();
+        unique_chars.dedup();
+        if unique_chars.len() <= 2 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Filters transcription output by removing filler words, stutter artifacts, and hallucinations.
 ///
 /// This function cleans up raw transcription text by:
-/// 1. Removing filler words (uh, um, hmm, etc.)
-/// 2. Collapsing repeated 1-2 letter stutters (e.g., "wh wh wh" -> "wh")
-/// 3. Cleaning up excess whitespace
+/// 1. Collapsing repeated punctuation (e.g., "!!!" -> "!")
+/// 2. Removing repeated single character patterns (e.g., "f f f f" -> "")
+/// 3. Removing filler words (uh, um, hmm, etc.)
+/// 4. Collapsing repeated 1-2 letter stutters (e.g., "wh wh wh" -> "wh")
+/// 5. Cleaning up excess whitespace
 ///
 /// # Arguments
 /// * `text` - The raw transcription text to filter
 ///
 /// # Returns
-/// The filtered text with filler words and stutters removed
+/// The filtered text with filler words, stutters, and hallucinations removed
 pub fn filter_transcription_output(text: &str) -> String {
     let mut filtered = text.to_string();
+
+    // Collapse repeated punctuation (e.g., "!!!" -> "!")
+    filtered = REPEATED_EXCLAMATION.replace_all(&filtered, "!").to_string();
+    filtered = REPEATED_QUESTION.replace_all(&filtered, "?").to_string();
+    filtered = REPEATED_PERIOD.replace_all(&filtered, "...").to_string();
+    filtered = REPEATED_COMMA.replace_all(&filtered, ",").to_string();
+    filtered = REPEATED_DASH.replace_all(&filtered, "--").to_string();
+
+    // Remove repeated single character patterns (e.g., "f f f f" -> "")
+    filtered = remove_repeated_single_chars(&filtered);
 
     // Remove filler words
     for pattern in FILLER_PATTERNS.iter() {
@@ -340,5 +463,62 @@ mod tests {
         let text = "no no is fine";
         let result = filter_transcription_output(text);
         assert_eq!(result, "no no is fine");
+    }
+
+    #[test]
+    fn test_filter_repeated_punctuation() {
+        let text = "Hello!!! World???";
+        let result = filter_transcription_output(text);
+        assert_eq!(result, "Hello! World?");
+    }
+
+    #[test]
+    fn test_filter_repeated_chars() {
+        // 5+ repetitions of single chars are removed as hallucinations
+        let text = "f f f f f f hello";
+        let result = filter_transcription_output(text);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_filter_preserves_normal_exclamation() {
+        let text = "Really?! That's amazing!";
+        let result = filter_transcription_output(text);
+        assert_eq!(result, "Really?! That's amazing!");
+    }
+
+    #[test]
+    fn test_is_hallucination_empty() {
+        assert!(is_likely_hallucination(""));
+        assert!(is_likely_hallucination("   "));
+        assert!(is_likely_hallucination("a"));
+    }
+
+    #[test]
+    fn test_is_hallucination_known_phrases() {
+        assert!(is_likely_hallucination("Thank you for watching"));
+        assert!(is_likely_hallucination("thanks for watching this video"));
+        assert!(is_likely_hallucination("[music]"));
+        assert!(is_likely_hallucination("[applause]"));
+    }
+
+    #[test]
+    fn test_is_hallucination_non_alpha() {
+        assert!(is_likely_hallucination("!!!!!!!!"));
+        assert!(is_likely_hallucination("..........."));
+        assert!(is_likely_hallucination("???!???!???"));
+    }
+
+    #[test]
+    fn test_is_hallucination_repetitive() {
+        assert!(is_likely_hallucination("ffffffffff"));
+        assert!(is_likely_hallucination("aaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn test_is_not_hallucination_valid() {
+        assert!(!is_likely_hallucination("Hello world"));
+        assert!(!is_likely_hallucination("This is a normal sentence."));
+        assert!(!is_likely_hallucination("Testing 123"));
     }
 }

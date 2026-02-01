@@ -118,9 +118,10 @@ fn create_audio_recorder(
     vad_path: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<AudioRecorder, anyhow::Error> {
-    let silero = SileroVad::new(vad_path, 0.3)
+    // VAD threshold 0.35 balances sensitivity with hallucination prevention
+    let silero = SileroVad::new(vad_path, 0.35)
         .map_err(|e| anyhow::anyhow!("Failed to create SileroVad: {}", e))?;
-    let smoothed_vad = SmoothedVad::new(Box::new(silero), 15, 15, 2);
+    let smoothed_vad = SmoothedVad::new(Box::new(silero), 15, 12, 2);
 
     // Recorder with VAD plus a spectrum-level callback that forwards updates to
     // the frontend.
